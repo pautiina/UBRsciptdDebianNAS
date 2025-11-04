@@ -1,0 +1,156 @@
+#!/usr/bin/env bash
+# /usr/local/bin/userctl
+set -euo pipefail
+
+NFT_NS="inet firewall"
+NAT_NS="ip nat"
+
+IF_LAN="vlan100"
+IF_WAN="vlan3310"
+
+DB="/var/lib/isp/users.db"   # persistent list
+mkdir -p $(dirname "$DB")
+touch "$DB"
+
+usage() {
+  cat <<EOF
+Usage:
+  userctl add  <IP> <UP_Mbit> <DOWN_Mbit> [public-ip]
+  userctl del  <IP>
+  userctl show <IP>
+EOF
+  exit 1
+}
+
+# generate stable mark from last two octets (0..65535)
+gen_mark() {
+  local ip=$1
+  IFS='.' read -r a b c d <<< "$ip"
+  # ensure numeric, compute (c<<8)+d
+  printf "%d" $(( (c << 8) + d ))
+}
+
+# create TC class for interface
+tc_create_class() {
+  local ifc=$1
+  local classid=$2
+  local rate=$3
+
+  tc class add dev "$ifc" parent 1:1 classid "$classid" htb rate "${rate}" ceil "${rate}" 2>/dev/null || true
+  tc qdisc add dev "$ifc" parent "$classid" fq 2>/dev/null || true
+}
+
+# add user
+add_user() {
+  local ip=$1; local up=$2; local down=$3; local pubip=${4:-}
+
+  if [[ -z "$ip" || -z "$up" || -z "$down" ]]; then
+    usage
+  fi
+
+  # mark
+  local mark
+  mark=$(gen_mark "$ip")
+  if (( mark == 0 )); then
+    echo "Invalid mark (0) for $ip" >&2
+    exit 1
+  fi
+
+  echo "[+] Adding $ip up=${up}M down=${down}M mark=${mark} pubip=${pubip:-<pool>}"
+
+  # 1) add to allowed_clients
+  nft add element $NFT_NS allowed_clients { $ip } 2>/dev/null || true
+
+  # 2) add to client_mark map
+  nft add element $NFT_NS client_mark { $ip : $mark } 2>/dev/null || nft replace element $NFT_NS client_mark { $ip : $mark } 2>/dev/null || true
+
+  # 3) if public IP provided, add static mapping in NAT map
+  if [[ -n "$pubip" ]]; then
+    nft add element $NAT_NS public_pool_map { $ip : $pubip } 2>/dev/null || nft replace element $NAT_NS public_pool_map { $ip : $pubip } 2>/dev/null || true
+    echo "    -> static SNAT $ip -> $pubip"
+  fi
+
+  # 4) create TC classes & filters
+  local LAST_OCTET=$(echo "$ip" | awk -F. '{print $4}')
+  # classids use mark to reduce collisions: 1:<mark>
+  local CLASS_LAN="1:${mark}"
+  local CLASS_WAN="1:${mark}"
+
+  # create classes
+  tc_create_class "$IF_LAN" "$CLASS_LAN" "${up}mbit"
+  tc_create_class "$IF_WAN" "$CLASS_WAN" "${down}mbit"
+
+  # attach filters:
+  # LAN: match src ip
+  tc filter add dev "$IF_LAN" parent 1:0 protocol ip prio 1 u32 match ip src "${ip}/32" flowid "$CLASS_LAN" 2>/dev/null || true
+
+  # WAN: match by fwmark (decimal)
+  tc filter add dev "$IF_WAN" parent 1:0 protocol ip prio 1 handle ${mark} fw classid "$CLASS_WAN" 2>/dev/null || true
+
+  # 5) persist to DB
+  # format: IP up down mark pubip
+  grep -v "^${ip} " "$DB" > "${DB}.tmp" || true
+  echo "${ip} ${up} ${down} ${mark} ${pubip:-}" >> "${DB}.tmp"
+  mv "${DB}.tmp" "$DB"
+
+  echo "[OK] added"
+}
+
+# delete user
+del_user() {
+  local ip=$1
+  if [[ -z "$ip" ]]; then usage; fi
+
+  # look up mark from map (fallback to calc)
+  local mark
+  mark=$(nft list map $NFT_NS client_mark 2>/dev/null | grep -w "$ip" | awk -F: '{print $2}' | tr -dc '0-9' || true)
+  if [[ -z "$mark" ]]; then
+    mark=$(gen_mark "$ip")
+  fi
+
+  echo "[-] Removing $ip mark=$mark"
+
+  nft delete element $NFT_NS allowed_clients { $ip } 2>/dev/null || true
+  nft delete element $NFT_NS client_mark { $ip : $mark } 2>/dev/null || true
+  nft delete element $NAT_NS public_pool_map { $ip : 46.172.84.192 } 2>/dev/null || true || true
+  # remove mapping by IP regardless of value:
+  # (iterate map entries and delete matching)
+  nft -a list map $NAT_NS public_pool_map 2>/dev/null | awk -F: -v ip="$ip" '$0 ~ ip { print $0 }' | while read -r l; do
+    # format: <handle> : <key> : <value>
+    key=$(echo "$l" | awk -F: '{gsub(/ /,"",$2); print $2}')
+    val=$(echo "$l" | awk -F: '{gsub(/ /,"",$3); print $3}')
+    nft delete element $NAT_NS public_pool_map { ${key} : ${val} } 2>/dev/null || true
+  done
+
+  # delete tc filters & classes
+  tc filter del dev "$IF_LAN" parent 1: protocol ip prio 1 u32 match ip src "${ip}/32" flowid 1:${mark} 2>/dev/null || true
+  tc class del dev "$IF_LAN" classid 1:${mark} 2>/dev/null || true
+
+  tc filter del dev "$IF_WAN" parent 1: protocol ip prio 1 handle ${mark} fw 2>/dev/null || true
+  tc class del dev "$IF_WAN" classid 1:${mark} 2>/dev/null || true
+
+  # remove from DB
+  grep -v "^${ip} " "$DB" > "${DB}.tmp" || true
+  mv "${DB}.tmp" "$DB"
+
+  echo "[OK] removed"
+}
+
+show_user() {
+  local ip=$1
+  grep "^${ip} " "$DB" || echo "Not found in DB"
+  nft list element $NFT_NS allowed_clients 2>/dev/null | grep "$ip" || true
+  nft list map $NFT_NS client_mark 2>/dev/null | grep "$ip" || true
+  nft list map $NAT_NS public_pool_map 2>/dev/null | grep "$ip" || true
+}
+
+if [[ $# -lt 2 ]]; then
+  usage
+fi
+
+case "$1" in
+  add) add_user "$2" "$3" "$4" "${5:-}" ;;
+  del) del_user "$2" ;;
+  show) show_user "$2" ;;
+  *) usage ;;
+esac
