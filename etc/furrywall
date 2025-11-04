@@ -1,0 +1,41 @@
+#!/usr/bin/bash
+
+############ CONFIGURATION SECTION ############
+LAN_IF="vlan100"
+WAN_IF="vlan3310"
+BANDWIDTH="10gbit"
+
+###############################################
+
+TC="/sbin/tc"
+
+$TC qdisc add dev ${LAN_IF} root handle 1: htb default 999
+$TC class add dev ${LAN_IF} parent 1: classid 1:1 htb rate ${BANDWIDTH} ceil ${BANDWIDTH}
+
+$TC qdisc add dev ${WAN_IF} root handle 1: htb default 999
+$TC class add dev ${WAN_IF} parent 1: classid 1:1 htb rate ${BANDWIDTH} ceil ${BANDWIDTH}
+
+#starting bandwidthd
+#service bandwidthd start
+
+#                              /
+#                   __       //
+#                   -\= \=\ //
+#                 --=_\=---//=--
+#               -_==/  \/ //\/--
+#                ==/   /O   O\==--
+#   _ _ _ _     /_/    \  ]  /--
+#  /\ ( (- \    /       ] ] ]==-
+# (\ _\_\_\-\__/     \  (,_,)--
+#(\_/                 \     \-
+#\/      /       (   ( \  ] /)
+#/      (         \   \_ \./ )
+#(       \         \      )  \
+#(       /\_ _ _ _ /---/ /\_  \
+# \     / \     / ____/ /   \  \
+#  (   /   )   / /  /__ )   (  )
+#  (  )   / __/ '---`       / /
+#  \  /   \ \             _/ /
+#  ] ]     )_\_         /__\/
+#  /_\     ]___\
+# (___)
