@@ -1,0 +1,410 @@
+#!/usr/bin/env bash
+# userctl - manage per-user SNAT + per-user TC (live: nft + tc)
+# supports add/del/list/show + auto-detect TC root and public-ip allocator
+# Compatible with nft v1.1.3 style (list set / list map)
+
+set -euo pipefail
+
+# ----------------- CONFIG (edit if needed) -----------------
+LAN_IF="ens1f1"
+WAN_IF="vlan3310"
+
+NFT_FAMILY="inet"
+NFT_TABLE="firewall"
+NFT_SET="allowed_clients"
+NFT_MAP="client_mark"
+
+NAT_FAMILY="ip"
+NAT_TABLE="nat"
+NAT_MAP="public_pool_map"
+
+# tc root handle and default
+TC_ROOT_HANDLE="1:"
+TC_ROOT_DEFAULT="999"
+TC_R2Q="100" # increased to avoid quantum warnings for high bandwidth
+BANDWIDTH="10gbit" # total bandwidth, match boot script
+
+# device used for reading class info (we put per-client classes on WAN_IF and LAN_IF)
+TC_DEV_WAN="$WAN_IF"
+TC_DEV_LAN="$LAN_IF"
+# ----------------------------------------------------------
+
+usage() {
+cat <<EOF
+	Usage:
+	userctl add <ip> <up_mbit> <down_mbit> [public-ip]
+	- public-ip optional: if specified, it will be assigned manually.
+	userctl del <ip>
+	userctl list
+	userctl show <ip>
+	userctl status <ip> # alias to show
+EOF
+	exit 1
+}
+
+# ---------------- utilities ----------------
+num() { echo "$1" | tr -dc '0-9'; }
+
+ip2int() {
+	local IFS=.
+	read -r a b c d <<< "$1"
+	echo $(( (a<<24) + (b<<16) + (c<<8) + d ))
+}
+
+int2ip() {
+	local ipnum=$1
+	echo "$(( (ipnum>>24) & 255 )).$(( (ipnum>>16) & 255 )).$(( (ipnum>>8) & 255 )).$(( ipnum & 255 ))"
+}
+
+# generate stable mark decimal from last two octets (0..65535)
+gen_mark() {
+	local ip=$1
+	IFS='.' read -r a b c d <<< "$ip"
+	# ensure numeric
+	c=${c:-0}; d=${d:-0}
+	printf "%d" $(( (c << 8) + d ))
+}
+
+# get tc class minor id from mark (offset to avoid conflicts with 1:1, 1:999)
+get_class_minor() {
+	local mark=$1
+	echo $(( (mark % 60000) + 1000 ))
+}
+
+# normalize rate (e.g., 100000Kbit -> 100Mbit)
+normalize_rate() {
+	local r=$1
+	if [[ $r =~ ([0-9]+)Kbit ]]; then
+	local num=${BASH_REMATCH[1]}
+	echo $((num / 1000))Mbit
+	elif [[ $r =~ ([0-9]+)Mbit ]]; then
+	echo ${BASH_REMATCH[1]}Mbit
+	elif [[ $r =~ ([0-9]+)Gbit ]]; then
+	echo ${BASH_REMATCH[1]}Gbit
+	else
+	echo $r
+	fi
+}
+
+# validate IP (simple check)
+is_valid_ip() {
+	local ip=$1
+	[[ $ip =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] && {
+		IFS='.' read -r a b c d <<< "$ip"
+		[[ $a -le 255 && $b -le 255 && $c -le 255 && $d -le 255 ]]
+	}
+}
+
+# ensure nft sets/maps exist (no changes to rules)
+ensure_sets_maps() {
+	if ! nft list set ${NFT_FAMILY} ${NFT_TABLE} ${NFT_SET} >/dev/null 2>&1; then
+	nft add set ${NFT_FAMILY} ${NFT_TABLE} ${NFT_SET} "{ type ipv4_addr; flags interval, auto-merge; }" || { echo "Error: Failed to add set ${NFT_SET}"; exit 1; }
+	fi
+	
+	if ! nft list map ${NFT_FAMILY} ${NFT_TABLE} ${NFT_MAP} >/dev/null 2>&1; then
+	nft add map ${NFT_FAMILY} ${NFT_TABLE} ${NFT_MAP} "{ type ipv4_addr: mark; }" || { echo "Error: Failed to add map ${NFT_MAP}"; exit 1; }
+	fi
+	
+	if ! nft list map ${NAT_FAMILY} ${NAT_TABLE} ${NAT_MAP} >/dev/null 2>&1; then
+	nft add map ${NAT_FAMILY} ${NAT_TABLE} ${NAT_MAP} "{ type ipv4_addr: ipv4_addr; }" || { echo "Error: Failed to add map ${NAT_MAP}"; exit 1; }
+	fi
+}
+
+# find mark for ip from nft map (decimal)
+get_mark() {
+	local ip=$1
+	nft list map ${NFT_FAMILY} ${NFT_TABLE} ${NFT_MAP} 2>/dev/null \
+	| awk -v k="$ip" '
+	{ data = data $0 " " }
+	END {
+		gsub(/[ \t{}]/,"", data);
+		sub(/^.*elements=/,"", data);
+		sub(/\}.*$/,"", data);
+		split(data, elems, ",");
+		for (e in elems) {
+			split(elems[e], parts, ":");
+			if (parts[1] == k) {
+				print hex2dec(parts[2])
+				exit
+			}
+		}
+	}
+	function hex2dec(hex,    i, dec, len, char) {
+		hex = toupper(hex)
+		sub(/^0X/, "", hex)
+		len = length(hex)
+		dec = 0
+		for (i = 1; i <= len; i++) {
+			char = substr(hex, i, 1)
+			if (char ~ /[0-9]/) dec = dec * 16 + (char + 0)
+			else if (char == "A") dec = dec * 16 + 10
+			else if (char == "B") dec = dec * 16 + 11
+			else if (char == "C") dec = dec * 16 + 12
+			else if (char == "D") dec = dec * 16 + 13
+			else if (char == "E") dec = dec * 16 + 14
+			else if (char == "F") dec = dec * 16 + 15
+		}
+		return dec
+	}' || echo ""
+}
+
+# find public ip mapped in nat map
+get_public_ip() {
+	local ip=$1
+	nft list map ${NAT_FAMILY} ${NAT_TABLE} ${NAT_MAP} 2>/dev/null \
+	| awk -v k="$ip" '
+	{ data = data $0 " " }
+	END {
+		gsub(/[ \t{}]/,"", data);
+		sub(/^.*elements=/,"", data);
+		sub(/\}.*$/,"", data);
+		split(data, elems, ",");
+		for (e in elems) {
+			split(elems[e], parts, ":");
+			if (parts[1] == k) {
+				print parts[2]
+				exit
+			}
+		}
+	}' || echo ""
+}
+
+# ensure tc root on given interface (create if missing)
+ensure_tc_root() {
+	local ifc=$1
+	# check if root qdisc exists
+	if ! tc qdisc show dev "$ifc" | grep -q "htb" ; then
+	tc qdisc add dev "$ifc" root handle ${TC_ROOT_HANDLE} htb default ${TC_ROOT_DEFAULT} r2q ${TC_R2Q} || { echo "Error: Failed to add root qdisc on $ifc"; exit 1; }
+	fi
+	# create root parent class 1:1 if missing
+	if ! tc class show dev "$ifc" | grep -q "1:1"; then
+	tc class add dev "$ifc" parent ${TC_ROOT_HANDLE} classid ${TC_ROOT_HANDLE}1 htb rate ${BANDWIDTH} ceil ${BANDWIDTH} || { echo "Error: Failed to add class 1:1 on $ifc"; exit 1; }
+	fi
+	# create default class 1:999 if missing
+	if ! tc class show dev "$ifc" | grep -q "1:${TC_ROOT_DEFAULT}"; then
+	tc class add dev "$ifc" parent ${TC_ROOT_HANDLE}1 classid ${TC_ROOT_HANDLE}${TC_ROOT_DEFAULT} htb rate ${BANDWIDTH} ceil ${BANDWIDTH} || true
+	fi
+}
+
+# helper: read members of allowed_clients set
+list_allowed_ips() {
+	nft list set ${NFT_FAMILY} ${NFT_TABLE} ${NFT_SET} 2>/dev/null \
+	| awk '
+	{ data = data $0 " " }
+	END {
+		gsub(/[ \t{}]/,"", data);
+		sub(/^.*elements=/,"", data);
+		sub(/\}.*$/,"", data);
+		split(data, a, ",");
+		for (i in a) if (a[i]) print a[i];
+	}
+	'
+}
+
+# get tc class rate for classid 1:<minor> on interface
+get_tc_rate_for_mark() {
+	local ifc=$1; local mark=$2
+	local minor=$(get_class_minor "$mark")
+	tc class show dev "$ifc" 2>/dev/null | awk -v cls="1:"$minor 'BEGIN{r="";c=""} $0~cls{ for(i=1;i<=NF;i++){ if($i=="rate"){r=$(i+1)} if($i=="ceil"){c=$(i+1)} } print r","c; exit }'
+}
+
+# delete public mapping (key ip) regardless value
+delete_nat_mapping_by_key() {
+	local ip="$1"
+	# iterate entries and delete ones with matching key (no -a to avoid handles)
+	nft list map ${NAT_FAMILY} ${NAT_TABLE} ${NAT_MAP} 2>/dev/null \
+	| awk -v ip="$ip" '
+	{ data = data $0 " " }
+	END {
+		gsub(/[ \t{}]/,"", data);
+		sub(/^.*elements=/,"", data);
+		sub(/\}.*$/,"", data);
+		split(data, elems, ",");
+		for (e in elems) {
+			split(elems[e], parts, ":");
+			if (parts[1] == ip) {
+				print parts[1] ":" parts[2]
+			}
+		}
+	}' \
+	| while IFS=: read -r key val; do
+	nft delete element ${NAT_FAMILY} ${NAT_TABLE} ${NAT_MAP} "{ ${key} : ${val} }" 2>/dev/null || true
+	done
+}
+
+# ---------------- COMMANDS ----------------
+
+cmd_add() {
+	local ip=$1; local up=$2; local down=$3; local pubip="${4:-}"
+	
+	[[ -z "$ip" || -z "$up" || -z "$down" ]] && usage
+	if ! is_valid_ip "$ip"; then echo "Error: Invalid IP $ip"; exit 1; fi
+	if ! [[ "$up" =~ ^[0-9]+$ && "$down" =~ ^[0-9]+$ ]]; then echo "Error: up/down must be positive integers"; exit 1; fi
+	
+	ensure_sets_maps
+	ensure_tc_root "$TC_DEV_WAN"
+	ensure_tc_root "$TC_DEV_LAN"
+	
+	# get or calc mark
+	local mark
+	mark=$(get_mark "$ip")
+	if [[ -z "$mark" ]]; then
+	mark=$(gen_mark "$ip")
+	fi
+	
+	# determine public ip to set
+	local assign_pub=""
+	if [[ -n "$pubip" ]]; then
+	if ! is_valid_ip "$pubip"; then echo "Error: Invalid public IP $pubip"; exit 1; fi
+	assign_pub="$pubip"
+	fi
+	
+	echo "[+] adding/updating $ip mark=$mark up=${up}M down=${down}M public=${assign_pub:-<none>}"
+	
+	# add allowed and client_mark (replace if exists)
+	nft add element ${NFT_FAMILY} ${NFT_TABLE} ${NFT_SET} "{ ${ip} }" || { echo "Error: Failed to add to ${NFT_SET}"; exit 1; }
+	
+	# replace client_mark: delete existing then add
+	nft delete element ${NFT_FAMILY} ${NFT_TABLE} ${NFT_MAP} "{ ${ip} }" 2>/dev/null || true
+	nft add element ${NFT_FAMILY} ${NFT_TABLE} ${NFT_MAP} "{ ${ip} : ${mark} }" || { echo "Error: Failed to add to ${NFT_MAP}"; exit 1; }
+	
+	# set public mapping only if specified
+	if [[ -n "${assign_pub}" ]]; then
+	delete_nat_mapping_by_key "$ip"
+	nft add element ${NAT_FAMILY} ${NAT_TABLE} ${NAT_MAP} "{ ${ip} : ${assign_pub} }" || { echo "Error: Failed to add to ${NAT_MAP}"; exit 1; }
+	fi
+	
+	# recreate tc classes on LAN and WAN for this mark (overwrite)
+	# classid 1:<minor>, parent 1:1
+	local minor=$(get_class_minor "$mark")
+	local parent_class="${TC_ROOT_HANDLE}1"  # 1:1
+	local user_classid="${TC_ROOT_HANDLE}${minor}"  # 1:<minor>
+	
+	# remove previous classes/filters if any
+	tc filter del dev "$TC_DEV_LAN" parent ${TC_ROOT_HANDLE} protocol ip prio 1 u32 match ip src ${ip}/32 2>/dev/null || true
+	tc class del dev "$TC_DEV_LAN" classid ${user_classid} 2>/dev/null || true
+	
+	tc filter del dev "$TC_DEV_WAN" parent ${TC_ROOT_HANDLE} protocol ip prio 1 handle ${mark} fw 2>/dev/null || true
+	tc class del dev "$TC_DEV_WAN" classid ${user_classid} 2>/dev/null || true
+	
+	# create classes: on LAN shape upstream (UP rate); on WAN downstream (DOWN rate)
+	tc class add dev "$TC_DEV_LAN" parent ${parent_class} classid ${user_classid} htb rate ${up}mbit ceil ${up}mbit || { echo "Error: Failed to add TC class on LAN"; exit 1; }
+	tc qdisc add dev "$TC_DEV_LAN" parent ${user_classid} fq || true
+	
+	tc class add dev "$TC_DEV_WAN" parent ${parent_class} classid ${user_classid} htb rate ${down}mbit ceil ${down}mbit || { echo "Error: Failed to add TC class on WAN"; exit 1; }
+	tc qdisc add dev "$TC_DEV_WAN" parent ${user_classid} fq || true
+	
+	# attach filters
+	tc filter add dev "$TC_DEV_LAN" parent ${TC_ROOT_HANDLE} protocol ip prio 1 u32 match ip src ${ip}/32 flowid ${user_classid} || true
+	tc filter add dev "$TC_DEV_WAN" parent ${TC_ROOT_HANDLE} protocol ip prio 1 handle ${mark} fw classid ${user_classid} || true
+	
+	echo "[OK] added/updated"
+}
+
+cmd_del() {
+	local ip=$1
+	[[ -z "$ip" ]] && usage
+	if ! is_valid_ip "$ip"; then echo "Error: Invalid IP $ip"; exit 1; fi
+	
+	ensure_sets_maps
+	
+	local mark
+	mark=$(get_mark "$ip")
+	if [[ -z "$mark" ]]; then
+	mark=$(gen_mark "$ip")
+	fi
+	
+	echo "[-] removing $ip mark=$mark"
+	
+	nft delete element ${NFT_FAMILY} ${NFT_TABLE} ${NFT_SET} "{ ${ip} }" 2>/dev/null || true
+	nft delete element ${NFT_FAMILY} ${NFT_TABLE} ${NFT_MAP} "{ ${ip} }" 2>/dev/null || true
+	
+	delete_nat_mapping_by_key "$ip"
+	
+	# delete tc (classes/filters)
+	local minor=$(get_class_minor "$mark")
+	local user_classid="${TC_ROOT_HANDLE}${minor}"
+	tc filter del dev "$TC_DEV_LAN" parent ${TC_ROOT_HANDLE} protocol ip prio 1 u32 match ip src ${ip}/32 2>/dev/null || true
+	tc class del dev "$TC_DEV_LAN" classid ${user_classid} 2>/dev/null || true
+	
+	tc filter del dev "$TC_DEV_WAN" parent ${TC_ROOT_HANDLE} protocol ip prio 1 handle ${mark} fw 2>/dev/null || true
+	tc class del dev "$TC_DEV_WAN" classid ${user_classid} 2>/dev/null || true
+	
+	echo "[OK] removed"
+}
+
+cmd_list() {
+	ensure_sets_maps
+	ensure_tc_root "$TC_DEV_LAN"
+	ensure_tc_root "$TC_DEV_WAN"
+	
+	printf "%-16s %-6s %-10s %-10s %-16s\n" "IP" "MARK" "UP" "DOWN" "PUBLIC-IP"
+	printf -- "--------------------------------------------------------------------------------\n"
+	
+	# iterate allowed_clients (live source of truth)
+	list_allowed_ips | sort -t . -k 1,1n -k 2,2n -k 3,3n -k 4,4n | while read -r ip; do
+	[[ -z "$ip" ]] && continue
+	local mark=$(get_mark "$ip")
+	[[ -z "$mark" ]] && mark=$(gen_mark "$ip")
+	local pub=$(get_public_ip "$ip"); [[ -z "$pub" ]] && pub="—"
+	
+	local updown_l=$(get_tc_rate_for_mark "$TC_DEV_LAN" "$mark")
+	local up=$(echo "$updown_l" | cut -d, -f1); local down=$(get_tc_rate_for_mark "$TC_DEV_WAN" "$mark" | cut -d, -f1)
+	up=$(normalize_rate "$up"); down=$(normalize_rate "$down")
+	[[ -z "$up" ]] && up="—"; [[ -z "$down" ]] && down="—"
+	
+	printf "%-16s %-6s %-10s %-10s %-16s\n" "$ip" "$mark" "${up}" "${down}" "$pub"
+	done
+}
+
+cmd_show() {
+	local ip=$1
+	[[ -z "$ip" ]] && usage
+	ensure_sets_maps
+	
+	echo "=== $ip ==="
+	if list_allowed_ips | grep -q "^${ip}$"; then
+	echo "allowed: yes"
+	else
+	echo "allowed: no"
+	fi
+	
+	local mark=$(get_mark "$ip")
+	[[ -z "$mark" ]] && mark=$(gen_mark "$ip")
+	echo "mark: ${mark}"
+	
+	local pub=$(get_public_ip "$ip")
+	echo "public ip: ${pub:-(none)}"
+	
+	local minor=$(get_class_minor "$mark")
+	
+	echo "TC classes:"
+	echo " LAN (${TC_DEV_LAN}):"
+	tc class show dev "$TC_DEV_LAN" | grep -E "1:${minor}" || echo " (no class)"
+	echo " WAN (${TC_DEV_WAN}):"
+	tc class show dev "$TC_DEV_WAN" | grep -E "1:${minor}" || echo " (no class)"
+	
+	local updown_l=$(get_tc_rate_for_mark "$TC_DEV_LAN" "$mark")
+	local up=$(echo "$updown_l" | cut -d, -f1)
+	local down=$(get_tc_rate_for_mark "$TC_DEV_WAN" "$mark" | cut -d, -f1)
+	up=$(normalize_rate "$up"); down=$(normalize_rate "$down")
+	echo "Rates: UP=${up:-(none)} DOWN=${down:-(none)}"
+}
+
+# status is alias to show
+cmd_status() { cmd_show "$1"; }
+
+# ---------------- main ----------------
+if [[ $# -lt 1 ]]; then usage; fi
+
+cmd=$1; shift || true
+case "$cmd" in
+add) cmd_add "$@" ;;
+del) cmd_del "$@" ;;
+list) cmd_list ;;
+show) cmd_show "$1" ;;
+status) cmd_status "$1" ;;
+*) usage ;;
+esac
+
+exit 0
