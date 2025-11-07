@@ -1,41 +1,24 @@
 #!/usr/bin/bash
-
 ############ CONFIGURATION SECTION ############
-LAN_IF="vlan100"
-WAN_IF="vlan3310"
-BANDWIDTH="10gbit"
-
+LAN_IFS="ens1f1"
+WAN_IFS="vlan3310 ens1f0"
+BANDWIDTH="1gbit"
 ###############################################
-
 TC="/sbin/tc"
 
-$TC qdisc add dev ${LAN_IF} root handle 1: htb default 999
-$TC class add dev ${LAN_IF} parent 1: classid 1:1 htb rate ${BANDWIDTH} ceil ${BANDWIDTH}
+for ifc in $LAN_IFS; do
+  $TC qdisc del dev $ifc root
+  # Qdisc - БЕЗ rate
+  $TC qdisc add dev $ifc root handle 1: htb default 999 r2q 10 || true
+  # Class 1:1 - С rate
+  $TC class add dev $ifc parent 1: classid 1:1 htb rate ${BANDWIDTH} ceil ${BANDWIDTH} || true
+  # Default class
+  $TC class add dev $ifc parent 1:1 classid 1:999 htb rate ${BANDWIDTH} ceil ${BANDWIDTH} || true
+done
 
-$TC qdisc add dev ${WAN_IF} root handle 1: htb default 999
-$TC class add dev ${WAN_IF} parent 1: classid 1:1 htb rate ${BANDWIDTH} ceil ${BANDWIDTH}
-
-#starting bandwidthd
-#service bandwidthd start
-
-#                              /
-#                   __       //
-#                   -\= \=\ //
-#                 --=_\=---//=--
-#               -_==/  \/ //\/--
-#                ==/   /O   O\==--
-#   _ _ _ _     /_/    \  ]  /--
-#  /\ ( (- \    /       ] ] ]==-
-# (\ _\_\_\-\__/     \  (,_,)--
-#(\_/                 \     \-
-#\/      /       (   ( \  ] /)
-#/      (         \   \_ \./ )
-#(       \         \      )  \
-#(       /\_ _ _ _ /---/ /\_  \
-# \     / \     / ____/ /   \  \
-#  (   /   )   / /  /__ )   (  )
-#  (  )   / __/ '---`       / /
-#  \  /   \ \             _/ /
-#  ] ]     )_\_         /__\/
-#  /_\     ]___\
-# (___)
+for ifc in $WAN_IFS; do
+  $TC qdisc del dev $ifc root
+  $TC qdisc add dev $ifc root handle 1: htb default 999 r2q 10 || true
+  $TC class add dev $ifc parent 1: classid 1:1 htb rate ${BANDWIDTH} ceil ${BANDWIDTH} || true
+  $TC class add dev $ifc parent 1:1 classid 1:999 htb rate ${BANDWIDTH} ceil ${BANDWIDTH} || true
+done
