@@ -42,9 +42,23 @@ EOF
 }
 
 to_tc_unit() {
-	local kbit=$1
-	[[ "$kbit" =~ ^[0-9]+$ ]] || { echo "Error: kbit must be integer"; exit 1; }
-	echo "${kbit}kbit"
+  local value=$1
+  local num=$(echo "$value" | grep -oE '^[0-9]+')
+  local src_unit=$(echo "$value" | grep -oE '[a-z]+bit$' | tr '[:upper:]' '[:lower:]')
+  local kbit
+
+  case "$src_unit" in
+    kbit)  kbit=$num ;;
+    mbit)  kbit=$((num * 1000)) ;;
+    gbit)  kbit=$((num * 1000000)) ;;
+    *)     kbit=$num ;;
+  esac
+
+  case "$TC_UNIT" in
+    kbit) echo "${kbit}kbit" ;;
+    mbit) echo "$((kbit / 1000))mbit" ;;
+    gbit) echo "$((kbit / 1000000))gbit" ;;
+  esac
 }
 
 normalize_rate() {
