@@ -164,17 +164,26 @@ delete_nat_mapping_by_key() {
 }
 
 ensure_tc_root() {
-	local ifc=$1
-	local bw_converted=$(to_tc_unit "$BANDWIDTH")
-	
-	tc qdisc show dev "$ifc" | grep -q "htb.*root" || \
-	tc qdisc add dev "$ifc" root handle ${TC_ROOT_HANDLE} htb default ${TC_ROOT_DEFAULT} r2q ${TC_R2Q}
-	
-	tc class show dev "$ifc" | grep -q "1:1" || \
-	tc class add dev "$ifc" parent ${TC_ROOT_HANDLE} classid 1:1 htb rate $bw_converted ceil $bw_converted
-	
-	tc class show dev "$ifc" | grep -q "1:${TC_ROOT_DEFAULT}" || \
-	tc class add dev "$ifc" parent 1:1 classid 1:${TC_ROOT_DEFAULT} htb rate $bw_converted ceil $bw_converted
+  local ifc=$1
+  local bw_converted=$(to_tc_unit "$BANDWIDTH")
+
+  # 1. Добавляем qdisc (БЕЗ rate - только для class!)
+  if ! tc qdisc show dev "$ifc" | grep -q "htb.*root"; then
+    tc qdisc add dev "$ifc" root handle ${TC_ROOT_HANDLE} htb default ${TC_ROOT_DEFAULT} r2q ${TC_R2Q} || \
+      { echo "Error: Failed qdisc on $ifc"; exit 1; }
+  fi
+
+  # 2. Добавляем parent class 1:1 с rate
+  if ! tc class show dev "$ifc" | grep -q "1:1"; then
+    tc class add dev "$ifc" parent ${TC_ROOT_HANDLE} classid 1:1 htb rate $bw_converted ceil $bw_converted || \
+      { echo "Error: Failed class 1:1 on $ifc"; exit 1; }
+  fi
+
+  # 3. Default class 1:999
+  if ! tc class show dev "$ifc" | grep -q "1:${TC_ROOT_DEFAULT}"; then
+    tc class add dev "$ifc" parent 1:1 classid 1:${TC_ROOT_DEFAULT} htb rate $bw_converted ceil $bw_converted || \
+      echo "Warning: Default class on $ifc"
+  fi
 }
 
 get_tc_rate_for_mark() {
