@@ -1,0 +1,46 @@
+#!/bin/sh
+
+# ----------------- CONFIG -----------------
+LAN_IF="ens1f1"
+WAN_IF="vlan3310"
+NFT_FAMILY="inet"
+NFT_TABLE="firewall"
+NFT_SET="allowed_clients"
+NFT_MAP="client_mark"
+
+NAT_FAMILY="ip"
+NAT_TABLE="nat"
+NFT_MAP_U="client_mark_u"
+NFT_MAP_D="client_mark_d"
+# ----------------- CONFIG -----------------
+
+LOGIN=$1
+IP=$2
+CASH=$3
+ID=$4
+SPEED=`/etc/rscriptd/GetSpeed $LOGIN`
+UPSPEED=`/etc/rscriptd/GetUpSpeed $LOGIN`
+MAC="NO_MAC"
+SCOUNT="kbit"
+
+nft="/usr/sbin/nft"
+tc="/usr/sbin/tc"
+
+cur_date=`date \+\%Y.\%m.\%d`
+cur_time=`date \+\%H:\%M:\%S`
+
+DMARK=`expr $ID + 2`
+UMARK=`expr $ID + 5001`
+
+${tc} filter del dev ${LAN_IF} parent 1: protocol ip prio 1 handle ${DMARK} fw classid 1:${DMARK}
+${tc} class del dev ${LAN_IF} parent 1:1 classid 1:${DMARK}
+
+${tc} filter del dev ${WAN_IF} parent 1: protocol ip prio 1 handle ${UMARK} fw classid 1:${UMARK}
+${tc} class del dev ${WAN_IF} parent 1:1 classid 1:${UMARK}
+
+${nft} delete element ${NFT_FAMILY} ${NFT_TABLE} ${NFT_SET} "{ $IP }"
+${nft} delete element ${NFT_FAMILY} ${NFT_TABLE} ${NFT_MAP_D} "{ $IP }"
+${nft} delete element ${NFT_FAMILY} ${NFT_TABLE} ${NFT_MAP_U} "{ $IP }"
+
+# ADD TO LOG
+echo "$cur_date $cur_time DISCONNECT: ID-$ID;LOGIN-$LOGIN;IP-$IP;CASH-$CASH;SPEED-$SPEED;UPSPEED-$UPSPEED,MAC-$MAC" >> /var/stargazer/allconnect.log
