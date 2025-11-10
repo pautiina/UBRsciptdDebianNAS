@@ -1,0 +1,46 @@
+#!/bin/sh
+
+# ----------------- CONFIG -----------------
+LAN_IF="ens1f1"
+WAN_IF="vlan3310"
+NFT_FAMILY="inet"
+NFT_TABLE="firewall"
+NFT_SET="allowed_clients"
+NFT_MAP_U="client_mark_u"
+NFT_MAP_D="client_mark_d"
+
+NAT_FAMILY="ip"
+NAT_TABLE="nat"
+NAT_MAP="public_pool_map"
+# ----------------- CONFIG -----------------
+
+LOGIN=$1
+IP=$2
+CASH=$3
+ID=$4
+SPEED=`/etc/rscriptd/GetSpeed $LOGIN`
+UPSPEED=`/etc/rscriptd/GetUpSpeed $LOGIN`
+MAC=`/etc/rscriptd/GetMac $LOGIN`
+SCOUNT="kbit"
+
+nft="/usr/sbin/nft"
+tc="/usr/sbin/tc"
+
+cur_date=`date \+\%Y.\%m.\%d`
+cur_time=`date \+\%H:\%M:\%S`
+
+DMARK=`expr $ID + 2`
+UMARK=`expr $ID + 5001`
+
+${tc} class add dev ${LAN_IF} parent 1:1 classid 1:${DMARK} htb rate ${SPEED}${SCOUNT}
+${tc} filter add dev ${LAN_IF} parent 1: protocol ip prio 1 handle ${DMARK} fw classid 1:${DMARK}
+
+${tc} class add dev ${WAN_IF} parent 1:1 classid 1:${UMARK} htb rate ${UPSPEED}${SCOUNT}
+${tc} filter add dev ${WAN_IF} parent 1: protocol ip prio 1 handle ${UMARK} fw classid 1:${UMARK}
+
+${nft} add element ${NFT_FAMILY} ${NFT_TABLE} ${NFT_SET} "{ $IP }"
+${nft} add element ${NFT_FAMILY} ${NFT_TABLE} ${NFT_MAP_D} "{ $IP : 0x$DMARK }"
+${nft} add element ${NFT_FAMILY} ${NFT_TABLE} ${NFT_MAP_U} "{ $IP : 0x$UMARK }"
+
+# ADD TO LOG
+echo "$cur_date $cur_time CONNECT: ID-$ID;LOGIN-$LOGIN;IP-$IP;CASH-$CASH;SPEED-$SPEED;UPSPEED-$UPSPEED,MAC-$MAC" >> /var/stargazer/allconnect.log
