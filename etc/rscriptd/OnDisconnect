@@ -30,7 +30,7 @@ cur_date=`date \+\%Y.\%m.\%d`
 cur_time=`date \+\%H:\%M:\%S`
 
 DMARK=`expr $ID + 2`
-UMARK=`expr $ID + 5001`
+UMARK=`expr $ID + 7001`
 
 ${tc} filter del dev ${LAN_IF} parent 1: protocol ip prio 1 handle 0x${DMARK} fw classid 1:${DMARK}
 ${tc} class del dev ${LAN_IF} parent 1:1 classid 1:${DMARK}
