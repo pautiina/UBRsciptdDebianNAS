@@ -1,7 +1,7 @@
 #!/bin/sh
 
 # ----------------- CONFIG -----------------
-LAN_IF="ens1f1"
+LAN_IF="vlan165"
 WAN_IF="vlan3310"
 NFT_FAMILY="inet"
 NFT_TABLE="firewall"
@@ -30,13 +30,13 @@ cur_date=`date \+\%Y.\%m.\%d`
 cur_time=`date \+\%H:\%M:\%S`
 
 DMARK=`expr $ID + 2`
-UMARK=`expr $ID + 5001`
+UMARK=`expr $ID + 7001`
 
 ${tc} class add dev ${LAN_IF} parent 1:1 classid 1:${DMARK} htb rate ${SPEED}${SCOUNT}
-${tc} filter add dev ${LAN_IF} parent 1: protocol ip prio 1 handle ${DMARK} fw classid 1:${DMARK}
+${tc} filter add dev ${LAN_IF} parent 1: protocol ip prio 1 handle 0x${DMARK} fw classid 1:${DMARK}
 
 ${tc} class add dev ${WAN_IF} parent 1:1 classid 1:${UMARK} htb rate ${UPSPEED}${SCOUNT}
-${tc} filter add dev ${WAN_IF} parent 1: protocol ip prio 1 handle ${UMARK} fw classid 1:${UMARK}
+${tc} filter add dev ${WAN_IF} parent 1: protocol ip prio 1 handle 0x${UMARK} fw classid 1:${UMARK}
 
 ${nft} add element ${NFT_FAMILY} ${NFT_TABLE} ${NFT_SET} "{ $IP }"
 ${nft} add element ${NFT_FAMILY} ${NFT_TABLE} ${NFT_MAP_D} "{ $IP : 0x$DMARK }"
