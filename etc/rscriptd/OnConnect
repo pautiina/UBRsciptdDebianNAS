@@ -1,19 +1,21 @@
 #!/bin/sh
 
 # ----------------- CONFIG -----------------
-LAN_IF="vlan165"
+LAN_IF="vlan4001"
 WAN_IF="vlan3310"
 NFT_FAMILY="inet"
 NFT_TABLE="firewall"
 NFT_SET="allowed_clients"
 NFT_MAP_U="client_mark_u"
 NFT_MAP_D="client_mark_d"
+
 # ----------------- CONFIG -----------------
 
 LOGIN=$1
 IP=$2
-CASH=$3
-ID=$4
+CASH=$4
+ID=$3
+
 SPEED=`/etc/rscriptd/GetSpeed $LOGIN`
 UPSPEED=`/etc/rscriptd/GetUpSpeed $LOGIN`
 MAC=`/etc/rscriptd/GetMac $LOGIN`
@@ -29,10 +31,16 @@ DMARK=`expr $ID + 2`
 UMARK=`expr $ID + 7001`
 
 ${tc} class add dev ${LAN_IF} parent 1:1 classid 1:${DMARK} htb rate ${SPEED}${SCOUNT}
+#${tc} filter add dev ${LAN_IF} parent 1: protocol ip prio 1 handle 0x${DMARK} fw classid 1:${DMARK}
 ${tc} filter add dev ${LAN_IF} parent 1: protocol ip prio 1 handle ${DMARK} fw classid 1:${DMARK}
 
 ${tc} class add dev ${WAN_IF} parent 1:1 classid 1:${UMARK} htb rate ${UPSPEED}${SCOUNT}
+#${tc} filter add dev ${WAN_IF} parent 1: protocol ip prio 1 handle 0x${UMARK} fw classid 1:${UMARK}
 ${tc} filter add dev ${WAN_IF} parent 1: protocol ip prio 1 handle ${UMARK} fw classid 1:${UMARK}
+
+#${nft} add element ${NFT_FAMILY} ${NFT_TABLE} ${NFT_SET} "{ $IP }"
+#${nft} add element ${NFT_FAMILY} ${NFT_TABLE} ${NFT_MAP_D} "{ $IP : 0x$DMARK }"
+#${nft} add element ${NFT_FAMILY} ${NFT_TABLE} ${NFT_MAP_U} "{ $IP : 0x$UMARK }"
 
 ${nft} add element ${NFT_FAMILY} ${NFT_TABLE} ${NFT_SET} "{ $IP }"
 ${nft} add element ${NFT_FAMILY} ${NFT_TABLE} ${NFT_MAP_D} "{ $IP : $DMARK }"
