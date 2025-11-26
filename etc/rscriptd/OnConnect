@@ -28,23 +28,20 @@ cur_date=`date \+\%Y.\%m.\%d`
 cur_time=`date \+\%H:\%M:\%S`
 
 DMARK=`expr $ID + 2`
-UMARK=`expr $ID + 7001`
+UMARK=`expr $ID + 10001`
 
-${tc} class add dev ${LAN_IF} parent 1:1 classid 1:${DMARK} htb rate ${SPEED}${SCOUNT}
-#${tc} filter add dev ${LAN_IF} parent 1: protocol ip prio 1 handle 0x${DMARK} fw classid 1:${DMARK}
-${tc} filter add dev ${LAN_IF} parent 1: protocol ip prio 1 handle ${DMARK} fw classid 1:${DMARK}
+DMARK_HEX=$(printf "%x" $DMARK)
+UMARK_HEX=$(printf "%x" $UMARK)
 
-${tc} class add dev ${WAN_IF} parent 1:1 classid 1:${UMARK} htb rate ${UPSPEED}${SCOUNT}
-#${tc} filter add dev ${WAN_IF} parent 1: protocol ip prio 1 handle 0x${UMARK} fw classid 1:${UMARK}
-${tc} filter add dev ${WAN_IF} parent 1: protocol ip prio 1 handle ${UMARK} fw classid 1:${UMARK}
+${tc} class add dev ${LAN_IF} parent 1:1 classid 1:${DMARK_HEX} htb rate ${SPEED}${SCOUNT}
+${tc} filter add dev ${LAN_IF} parent 1: protocol ip prio 1 handle 0x${DMARK_HEX} fw classid 1:${DMARK_HEX}
 
-#${nft} add element ${NFT_FAMILY} ${NFT_TABLE} ${NFT_SET} "{ $IP }"
-#${nft} add element ${NFT_FAMILY} ${NFT_TABLE} ${NFT_MAP_D} "{ $IP : 0x$DMARK }"
-#${nft} add element ${NFT_FAMILY} ${NFT_TABLE} ${NFT_MAP_U} "{ $IP : 0x$UMARK }"
+${tc} class add dev ${WAN_IF} parent 1:1 classid 1:${UMARK_HEX} htb rate ${UPSPEED}${SCOUNT}
+${tc} filter add dev ${WAN_IF} parent 1: protocol ip prio 1 handle 0x${UMARK_HEX} fw classid 1:${UMARK_HEX}
 
 ${nft} add element ${NFT_FAMILY} ${NFT_TABLE} ${NFT_SET} "{ $IP }"
-${nft} add element ${NFT_FAMILY} ${NFT_TABLE} ${NFT_MAP_D} "{ $IP : $DMARK }"
-${nft} add element ${NFT_FAMILY} ${NFT_TABLE} ${NFT_MAP_U} "{ $IP : $UMARK }"
+${nft} add element ${NFT_FAMILY} ${NFT_TABLE} ${NFT_MAP_D} "{ $IP : 0x$DMARK_HEX }"
+${nft} add element ${NFT_FAMILY} ${NFT_TABLE} ${NFT_MAP_U} "{ $IP : 0x$UMARK_HEX }"
 
 # ADD TO LOG
-echo "$cur_date $cur_time CONNECT: ID-$ID;LOGIN-$LOGIN;IP-$IP;CASH-$CASH;SPEED-$SPEED;UPSPEED-$UPSPEED,MAC-$MAC" >> /var/stargazer/allconnect.log
+echo "$cur_date $cur_time CONNECT: ID-$ID;LOGIN-$LOGIN;IP-$IP;CASH-$CASH;SPEED-$SPEED;UPSPEED-$UPSPEED,MAC-$MAC,DMARK-$DMARK,UMARK-$UMARK,DMARK_HEX-$DMARK_HEX,UMARK_HEX-$UMARK_HEX" >> /var/stargazer/allconnect.log
