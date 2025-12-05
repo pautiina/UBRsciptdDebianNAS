@@ -1,54 +1,97 @@
 #!/bin/sh
-
-# ----------------- CONFIG -----------------
+############ CONFIGURATION SECTION ############
 LAN_IF="vlan4001"
-WAN_IF="vlan3310"
+IFB_IF="ifb0"
 NFT_FAMILY="inet"
 NFT_TABLE="firewall"
 NFT_SET="allowed_clients"
-NFT_MAP="client_mark"
+HASH_ROOT_IFB="2"
+HASH_ROOT_LAN="1"
+NFT="/sbin/nft"
+TC="/sbin/tc"
 
-NAT_FAMILY="ip"
-NAT_TABLE="nat"
-NFT_MAP_U="client_mark_u"
-NFT_MAP_D="client_mark_d"
-# ----------------- CONFIG -----------------
-
+#########################################################################
 LOGIN=$1
 IP=$2
 CASH=$4
 ID=$3
 
+#########################################################################
 SPEED=`/etc/rscriptd/GetSpeed $LOGIN`
 UPSPEED=`/etc/rscriptd/GetUpSpeed $LOGIN`
 MAC="NO_MAC"
 SCOUNT="kbit"
 
-nft="/usr/sbin/nft"
-tc="/usr/sbin/tc"
-
+#########################################################################
 cur_date=`date \+\%Y.\%m.\%d`
 cur_time=`date \+\%H:\%M:\%S`
 
+#########################################################################
+# 1. Генерація ClassID
+# розділяємо на DMARK і UMARK чисто для зручності пошуку, а так можуть бути однакові, так як фільтри створюються на різних інтерфейсах
 DMARK=`expr $ID + 2`
 UMARK=`expr $ID + 10001`
 
 DMARK_HEX=$(printf "%x" $DMARK)
 UMARK_HEX=$(printf "%x" $UMARK)
 
-# remove tc filters and class on LAN interface
-${tc} filter del dev ${LAN_IF} parent 1: protocol ip prio 1 handle 0x${DMARK_HEX} fw classid 1:${DMARK_HEX}
-${tc} class del dev ${LAN_IF} parent 1:1 classid 1:${DMARK_HEX}
+#########################################################################
+# 2. Генерація Filter Handle (Для u32 фільтра - МАКСИМУМ 0xFFF! < 4095)
+# Беремо ID користувача і накладаємо маску 0xFFF (4095).
+# Це гарантує, що хендл завжди валідний для u32.
+FILTER_ID=$((ID & 4095))
+FILTER_ID_HEX=$(printf "%x" $FILTER_ID)
 
-# remove tc filters and class on WAN interface
-${tc} filter del dev ${WAN_IF} parent 1: protocol ip prio 1 handle 0x${UMARK_HEX} fw classid 1:${UMARK_HEX}
-${tc} class del dev ${WAN_IF} parent 1:1 classid 1:${UMARK_HEX}
+#########################################################################
+# 2. Генерація Filter Handle (Для u32 фільтра - МАКСИМУМ 0xFFF!)
+# Беремо ID користувача і накладаємо маску 0xFFF (4095).
+# Це гарантує, що хендл завжди валідний для u32.
+# Прикалад: IP 10.10.165.2 -> O3=165, O4=2 -> Hex a502
+FILTER_ID=$(((ID + 1) & 4095))
+FILTER_ID_HEX=$(printf "%x" $FILTER_ID)
 
-# remove nft elements
-${nft} delete element ${NFT_FAMILY} ${NFT_TABLE} ${NFT_SET} "{ $IP }"
-${nft} delete element ${NFT_FAMILY} ${NFT_TABLE} ${NFT_MAP_D} "{ $IP }"
-${nft} delete element ${NFT_FAMILY} ${NFT_TABLE} ${NFT_MAP_U} "{ $IP }"
+O3=$(echo $IP | awk -F . '{print $3}')
+O4=$(echo $IP | awk -F . '{print $4}')
+
+TABLE_ID=$(printf "%02x" $((O3+1)))
+BUCKET_HEX=$(printf "%x" $O4)
+
+#########################################################################
+# 4. ФОРМУВАННЯ ПОВНОГО HANDLE (Таблиця:Кошик:ID). Окремо для UPLOAD і DOWNLOAD, знову ж таки - чисто для зручності пошуку
+FULL_HANDLE_FILTER="${TABLE_ID}:${BUCKET_HEX}:${FILTER_ID_HEX}"
+
+#####################################################################
+# 1. DOWNLOAD (LAN Interface)
+#####################################################################
+# ВИДАЛЕННЯ ПО ПОВНОМУ HANDLE
+#tc filter del dev vlan4001 parent 1:0 protocol ip pref 3 handle a6:2:800 u32
+$TC filter del dev ${LAN_IF} parent ${HASH_ROOT_LAN}:0 protocol ip pref 3 handle ${FULL_HANDLE_FILTER} u32 >/dev/null 2>&1
+
+# Видялємо дочірню чергу
+# практично команду можна не запускати. Дочірня черга сама видалиться при видаленні класу
+$TC qdisc del dev ${LAN_IF} parent ${HASH_ROOT_LAN}:${DMARK_HEX} handle ${DMARK_HEX} fq_codel
+
+# Видаляємо клас
+$TC class del dev ${LAN_IF} classid ${HASH_ROOT_LAN}:${DMARK_HEX}
+
+#####################################################################
+# 2. UPLOAD (IFB Interface)
+#####################################################################
+# ВИДАЛЕННЯ ПО ПОВНОМУ HANDLE
+$TC filter del dev ${IFB_IF} parent ${HASH_ROOT_IFB}:0 protocol ip pref 3 handle ${FULL_HANDLE_FILTER} u32 >/dev/null 2>&1
+
+# Видялємо дочірню чергу
+# практично команду можна не запускати. Дочірня черга сама видалиться при видаленні класу
+$TC qdisc del dev ${IFB_IF} parent ${HASH_ROOT_IFB}:${UMARK_HEX} handle ${UMARK_HEX} fq_codel
+
+# Видаляємо клас
+$TC class del dev ${IFB_IF} classid ${HASH_ROOT_IFB}:${UMARK_HEX}
+
+#####################################################################
+# 3. FIREWALL
+# remove nft elems
+#####################################################################
+${NFT} delete element ${NFT_FAMILY} ${NFT_TABLE} ${NFT_SET} "{ $IP }"
 
 # ADD TO LOG
 echo "$cur_date $cur_time DISCONNECT: ID-$ID;LOGIN-$LOGIN;IP-$IP;CASH-$CASH;SPEED-$SPEED;UPSPEED-$UPSPEED,MAC-$MAC,DMARK-$DMARK,UMARK-$UMARK,DMARK_HEX-$DMARK_HEX,UMARK_HEX-$UMARK_HEX" >> /var/stargazer/allconnect.log
-
