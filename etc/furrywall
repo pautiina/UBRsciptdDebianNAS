@@ -1,24 +1,97 @@
 #!/usr/bin/bash
 ############ CONFIGURATION SECTION ############
-LAN_IFS="ens1f1"
-WAN_IFS="vlan3310 ens1f0"
-BANDWIDTH="1gbit"
-###############################################
+LAN_IF="vlan4001"
+IFB_IF="ifb0"
 TC="/sbin/tc"
+BANDWIDTH="10gbit"
+HASH_ROOT_IFB="2"
+HASH_ROOT_LAN="1"
+pref="10"
+#########################################################################
+########### LOAD IFB KERNEL MODULE FOR SHAPING UPLOAD TRAFFIC ###########
+modprobe ifb numifbs=1
+#########################################################################
+# --- CLEAN ALL ---
+# Видаляємо старе, щоб забрати дублі 800:, 801: і т.д.
+$TC qdisc del dev ${WAN_IF} root 2>/dev/null
 
-for ifc in $LAN_IFS; do
-  $TC qdisc del dev $ifc root
-  # Qdisc - БЕЗ rate
-  $TC qdisc add dev $ifc root handle 1: htb default 999 r2q 10 || true
-  # Class 1:1 - С rate
-  $TC class add dev $ifc parent 1: classid 1:1 htb rate ${BANDWIDTH} ceil ${BANDWIDTH} || true
-  # Default class
-  $TC class add dev $ifc parent 1:1 classid 1:999 htb rate ${BANDWIDTH} ceil ${BANDWIDTH} || true
+$TC qdisc del dev ${LAN_IF} root 2>/dev/null
+$TC qdisc del dev ${LAN_IF} ingress 2>/dev/null
+
+$TC qdisc del dev ${IFB_IF} root 2>/dev/null
+
+ip link set dev ${IFB_IF} down 2>/dev/null
+ip link del dev ${IFB_IF} 2>/dev/null
+
+############ CREATE IFB INTERFACE FOR SHAPING UPLOAD TRAFFIC ############
+# --- UPLOAD (IFB) ---
+ip link add ${IFB_IF} type ifb
+ip link set dev ${IFB_IF} up
+ip link set dev ${IFB_IF} txqueuelen 10000
+
+#########################################################################
+$TC qdisc add dev ${IFB_IF} root handle ${HASH_ROOT_IFB}: htb r2q ${pref} default ffff
+
+# Основний класс 10G
+$TC class add dev ${IFB_IF} root htb rate ${BANDWIDTH} ceil ${BANDWIDTH} quantum 65535
+
+# ДЕФОЛТНИЙ КЛАСС (2:ffff) - Гарантія 1Gbit.
+# rate = гарантовано (1Gbit), ceil = максимально (10Gbit).
+$TC class add dev ${IFB_IF} parent ${HASH_ROOT_IFB}:0 classid ${HASH_ROOT_IFB}:ffff htb rate 1gbit ceil ${BANDWIDTH} quantum 65535
+$TC qdisc add dev ${IFB_IF} parent ${HASH_ROOT_IFB}:ffff handle fff0 fq_codel limit 20480
+
+$TC filter add dev ${IFB_IF} parent ${HASH_ROOT_IFB}:0 protocol ip pref 1 u32
+$TC filter add dev ${IFB_IF} parent ${HASH_ROOT_IFB}:0 handle 999: protocol ip pref 2 u32 divisor 256
+$TC filter add dev ${IFB_IF} parent ${HASH_ROOT_IFB}:0 protocol ip pref 1 u32 ht 800:: match ip src 10.10.0.0/16 hashkey mask 0x0000ff00 at 12 link 999:
+
+#########################################################################
+# Гереруємо 256 таблиць хешу, під кожний 3-й октет мережі
+for i in $(seq 0 255); do
+	HEX=$(printf "%02x" $i)
+	TABLE_ID=$(printf "%02x" $((i+1)))
+
+	$TC filter add dev ${IFB_IF} parent ${HASH_ROOT_IFB}:0 handle ${TABLE_ID}: protocol ip pref 3 u32 divisor 256
+	#echo "TC: filter add dev ${IFB_IF} parent ${HASH_ROOT_IFB}:0 handle ${TABLE_ID}: protocol ip pref 3 u32 divisor 256"
+
+	$TC filter add dev ${IFB_IF} parent ${HASH_ROOT_IFB}:0 protocol ip pref 2 u32 ht 999:${HEX}: match ip src 10.10.${i}.0/24 hashkey mask 0x000000ff at 12 link ${TABLE_ID}:
+	#echo "TC: filter add dev ${IFB_IF} parent ${HASH_ROOT_IFB}:0 protocol ip pref 3 u32 ht 999:${HEX}: match ip src 0.0.${i}.0/24 hashkey mask 0x000000ff at 12 link ${TABLE_ID}:"
 done
 
-for ifc in $WAN_IFS; do
-  $TC qdisc del dev $ifc root
-  $TC qdisc add dev $ifc root handle 1: htb default 999 r2q 10 || true
-  $TC class add dev $ifc parent 1: classid 1:1 htb rate ${BANDWIDTH} ceil ${BANDWIDTH} || true
-  $TC class add dev $ifc parent 1:1 classid 1:999 htb rate ${BANDWIDTH} ceil ${BANDWIDTH} || true
+#########################################################################
+# --- DOWNLOAD (LAN) ---
+ip link set dev ${LAN_IF} txqueuelen 10000
+
+#########################################################################
+$TC qdisc add dev ${LAN_IF} root handle ${HASH_ROOT_LAN}: htb r2q ${pref} default ffff
+
+# Основной класс 10G
+$TC class add dev ${LAN_IF} root htb rate ${BANDWIDTH} ceil ${BANDWIDTH} quantum 65535
+
+# ДЕФОЛТНЫЙ КЛАСС (2:ffff) - Гарантия 1Gbit.
+# rate = гарантированная (1Gbit), ceil = максимальная (10Gbit).
+$TC class add dev ${LAN_IF} parent ${HASH_ROOT_LAN}:0 classid ${HASH_ROOT_LAN}:ffff htb rate 1gbit ceil ${BANDWIDTH} quantum 65535
+$TC qdisc add dev ${LAN_IF} parent ${HASH_ROOT_LAN}:ffff handle fff0 fq_codel limit 20480
+
+$TC filter add dev ${LAN_IF} parent ${HASH_ROOT_LAN}:0 protocol ip pref 1 u32
+$TC filter add dev ${LAN_IF} parent ${HASH_ROOT_LAN}:0 handle 999: protocol ip pref 2 u32 divisor 256
+$TC filter add dev ${LAN_IF} parent ${HASH_ROOT_LAN}:0 protocol ip pref 1 u32 ht 800:: match ip dst 10.10.0.0/16 hashkey mask 0x0000ff00 at 16 link 999:
+
+#########################################################################
+# Гереруємо 256 таблиць хешу, під кожний 3-й октет мережі
+for i in $(seq 0 255); do
+	HEX=$(printf "%02x" $i)
+	TABLE_ID=$(printf "%02x" $((i+1)))
+
+	$TC filter add dev ${LAN_IF} parent ${HASH_ROOT_LAN}:0 handle ${TABLE_ID}: protocol ip pref 3 u32 divisor 256
+	#echo "TC: filter add dev ${LAN_IF} parent ${HASH_ROOT_LAN}:0 handle ${TABLE_ID}: protocol ip pref 3 u32 divisor 256"
+
+	$TC filter add dev ${LAN_IF} parent ${HASH_ROOT_LAN}:0 protocol ip pref 2 u32 ht 999:${HEX}: match ip dst 10.10.${i}.0/24 hashkey mask 0x000000ff at 16 link ${TABLE_ID}:
+	#echo "TC: filter add dev ${LAN_IF} parent ${HASH_ROOT_LAN}:0 protocol ip pref 3 u32 ht 999:${HEX}: match ip dst 0.0.${i}.0/24 hashkey mask 0x000000ff at 16 link ${TABLE_ID}:"
 done
+
+#########################################################################
+# REDIRECT
+$TC qdisc add dev ${LAN_IF} handle ffff: ingress
+$TC filter add dev ${LAN_IF} parent ffff: protocol ip pref 1 u32 \
+    match ip src 0.0.0.0/0 \
+    action mirred egress redirect dev ${IFB_IF}
