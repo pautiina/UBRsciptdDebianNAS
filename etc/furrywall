@@ -61,7 +61,8 @@ done
 # MASK=0x000000ff, OCTET_3=84, TABLE_ID=$(printf "%02x" $((i+1))), TABLE_ID=55
 # main filter create previous:
 # $TC filter add dev ${IFB_IF} parent ${HASH_ROOT_IFB}:0 handle 55: protocol ip pref 3 u32 divisor 256
-$TC filter add dev ${IFB_IF} parent ${HASH_ROOT_IFB}:0 protocol ip pref 1 u32 ht 800:: order 2000 match ip src 2.2.2..0/24 hashkey mask 0x000000ff at 12 link 55:
+# ORDER 2000. Need create befor 10.10
+$TC filter add dev ${IFB_IF} parent ${HASH_ROOT_IFB}:0 protocol ip pref 1 u32 ht 800:: order 2000 match ip src 2.2.2.0/24 hashkey mask 0x000000ff at 12 link 55:
 
 #########################################################################
 # --- DOWNLOAD (LAN) ---
@@ -99,7 +100,8 @@ done
 # MASK=0x000000ff, OCTET_3=84, TABLE_ID=$(printf "%02x" $((i+1))), TABLE_ID=55
 # main filter create previous:
 # $TC filter add dev ${LAN_IF} parent ${HASH_ROOT_LAN}:0 handle 55: protocol ip pref 3 u32 divisor 256
-$TC filter add dev ${LAN_IF} parent ${HASH_ROOT_LAN}:0 protocol ip pref 1 u32 ht 800:: order 2000 match ip src 2.2.2..0/24 hashkey mask 0x000000ff at 16 link 55:
+# ORDER 2000. Need create befor 10.10
+$TC filter add dev ${LAN_IF} parent ${HASH_ROOT_LAN}:0 protocol ip pref 1 u32 ht 800:: order 2000 match ip dst 2.2.2.0/24 hashkey mask 0x000000ff at 16 link 55:
 
 #########################################################################
 # REDIRECT
