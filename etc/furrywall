@@ -51,11 +51,17 @@ for i in $(seq 0 255); do
 	TABLE_ID=$(printf "%02x" $((i+1)))
 
 	$TC filter add dev ${IFB_IF} parent ${HASH_ROOT_IFB}:0 handle ${TABLE_ID}: protocol ip pref 3 u32 divisor 256
-	#echo "TC: filter add dev ${IFB_IF} parent ${HASH_ROOT_IFB}:0 handle ${TABLE_ID}: protocol ip pref 3 u32 divisor 256"
+	echo "TC: filter add dev ${IFB_IF} parent ${HASH_ROOT_IFB}:0 handle ${TABLE_ID}: protocol ip pref 3 u32 divisor 256"
 
 	$TC filter add dev ${IFB_IF} parent ${HASH_ROOT_IFB}:0 protocol ip pref 2 u32 ht 999:${HEX}: match ip src 10.10.${i}.0/24 hashkey mask 0x000000ff at 12 link ${TABLE_ID}:
-	#echo "TC: filter add dev ${IFB_IF} parent ${HASH_ROOT_IFB}:0 protocol ip pref 3 u32 ht 999:${HEX}: match ip src 0.0.${i}.0/24 hashkey mask 0x000000ff at 12 link ${TABLE_ID}:"
+	echo "TC: filter add dev ${IFB_IF} parent ${HASH_ROOT_IFB}:0 protocol ip pref 3 u32 ht 999:${HEX}: match ip src 10.10.${i}.0/24 hashkey mask 0x000000ff at 12 link ${TABLE_ID}:"
 done
+
+# Filter for real IP
+# MASK=0x000000ff, OCTET_3=84, TABLE_ID=$(printf "%02x" $((i+1))), TABLE_ID=55
+# main filter create previous:
+# $TC filter add dev ${IFB_IF} parent ${HASH_ROOT_IFB}:0 handle 55: protocol ip pref 3 u32 divisor 256
+$TC filter add dev ${IFB_IF} parent ${HASH_ROOT_IFB}:0 protocol ip pref 1 u32 ht 800:: order 2000 match ip src 46.172.84.0/24 hashkey mask 0x000000ff at 12 link 55:
 
 #########################################################################
 # --- DOWNLOAD (LAN) ---
@@ -86,8 +92,14 @@ for i in $(seq 0 255); do
 	#echo "TC: filter add dev ${LAN_IF} parent ${HASH_ROOT_LAN}:0 handle ${TABLE_ID}: protocol ip pref 3 u32 divisor 256"
 
 	$TC filter add dev ${LAN_IF} parent ${HASH_ROOT_LAN}:0 protocol ip pref 2 u32 ht 999:${HEX}: match ip dst 10.10.${i}.0/24 hashkey mask 0x000000ff at 16 link ${TABLE_ID}:
-	#echo "TC: filter add dev ${LAN_IF} parent ${HASH_ROOT_LAN}:0 protocol ip pref 3 u32 ht 999:${HEX}: match ip dst 0.0.${i}.0/24 hashkey mask 0x000000ff at 16 link ${TABLE_ID}:"
+	#echo "TC: filter add dev ${LAN_IF} parent ${HASH_ROOT_LAN}:0 protocol ip pref 3 u32 ht 999:${HEX}: match ip dst 10.10.${i}.0/24 hashkey mask 0x000000ff at 16 link ${TABLE_ID}:"
 done
+
+# Filter for real IP
+# MASK=0x000000ff, OCTET_3=84, TABLE_ID=$(printf "%02x" $((i+1))), TABLE_ID=55
+# main filter create previous:
+# $TC filter add dev ${LAN_IF} parent ${HASH_ROOT_LAN}:0 handle 55: protocol ip pref 3 u32 divisor 256
+$TC filter add dev ${LAN_IF} parent ${HASH_ROOT_LAN}:0 protocol ip pref 1 u32 ht 800:: order 2000 match ip src 46.172.84.0/24 hashkey mask 0x000000ff at 16 link 55:
 
 #########################################################################
 # REDIRECT
