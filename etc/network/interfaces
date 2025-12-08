@@ -1,0 +1,46 @@
+# This file describes the network interfaces available on your system
+# and how to activate them. For more information, see interfaces(5).
+
+source /etc/network/interfaces.d/*
+
+# The loopback network interface
+auto lo
+iface lo inet loopback
+
+# The primary network interface
+allow-hotplug eno1
+iface eno1 inet manual
+
+# This is an autoconfigured IPv6 interface
+#iface eno1 inet6 auto
+
+auto ens1f0
+iface ens1f0 inet manual
+        post-up /sbin/ethtool -G ens1f0 rx 8192 tx 8192
+        post-up /sbin/ethtool -K ens1f0 gro on gso on tso on rxvlan off txvlan off hw-tc-offload off
+        post-up ip link set ens1f0 txqueuelen 10000
+
+auto vlan3310
+iface vlan3310 inet static
+        address 1.1.1.254/30
+        gateway 1.1.1.253
+        nameserver 1.1.1.1
+        nameserver 8.8.8.8
+        vlan-raw-device ens1f0
+        post-up ip link set vlan3310 txqueuelen 10000
+
+auto ens1f1
+iface ens1f1 inet manual
+        post-up /sbin/ethtool -G ens1f1 rx 8192 tx 8192
+        post-up /sbin/ethtool -K ens1f1 gro on gso on tso on rxvlan off txvlan off hw-tc-offload off
+        post-up ip link set ens1f1 txqueuelen 10000
+
+auto vlan4001
+iface vlan4001 inet static
+        address 10.0.1.1/30 
+        vlan-raw-device ens1f1
+        post-up ip link set vlan4001 txqueuelen 10000
+        post-up ip route add 10.0.0.0/8 via 10.0.1.2
+        post-up ip route add 2.2.2.0/26 via 10.0.1.2
+        post-up ip route add 2.2.2.64/26 via 10.0.1.2
+        post-up ip route add 2.2.2.128/26 via 10.0.1.2
