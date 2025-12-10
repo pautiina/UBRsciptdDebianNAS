@@ -1,4 +1,9 @@
 #!/usr/bin/env bash
+#
+# 
+#	THIS SCRIPT JUST PROJECT - NOT WORKING ON REAL LIFE
+#
+#
 # userctl - manage per-user SNAT + per-user TC (live: nft + tc)
 # supports add/del/list/show + auto-detect TC root and public-ip allocator
 # Compatible with nft v1.1.3 style (list set / list map)
